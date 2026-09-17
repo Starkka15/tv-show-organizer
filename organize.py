@@ -21,7 +21,14 @@ STATE_FILE = Path.home() / ".tv-organizer-state.json"
 CACHE_FILE = Path.home() / ".tv-organizer-cache.json"
 LOG_FILE   = Path.home() / "tv-organizer.log"
 
-VIDEO_EXTS = {'.mkv', '.mp4', '.avi', '.m4v', '.mov', '.ts', '.wmv'}
+VIDEO_EXTS = {'.mkv', '.mp4', '.avi', '.m4v', '.mov', '.ts', '.wmv',
+    # older fansub containers - .ogm in particular is standard for
+    # Exiled-Destiny era releases and was silently dropping whole shows
+    '.ogm', '.ogv', '.rmvb', '.webm', '.mpg', '.mpeg', '.divx', '.flv', '.m2ts'}
+
+# Sidecar subtitles travel with their episode. Without this a --commit moves
+# the video and strands every .ass/.srt beside it in the source folder.
+SUBTITLE_EXTS = {'.srt', '.ass', '.ssa', '.sub', '.idx', '.sup', '.vtt', '.smi'}
 
 SKIP_DIRS = {
     'extras', 'featurettes', 'behind the scenes', 'deleted scenes',
@@ -92,6 +99,7 @@ RE_EP_EPISODE    = re.compile(r'\bEpisode[\s.]*(\d{1,3})\b', re.I)            # 
 RE_EP_EPWORD     = re.compile(r'(?<![A-Za-z])Ep(\d{2,3})(?![A-Za-z])', re.I)  # Ep01 (Exiled-Destiny)
 RE_EP_EONLY      = re.compile(r'(?<!\w)[Ee](\d{2,3})(?!\w)')                  # E01 without S prefix
 # Allow: - 01 [hash], _01_(quality), - 01$, - 01 - Title, 01 Prologue, 01. Title
+RE_EP_BRACKET    = re.compile(r'\[(\d{1,3})\](?!\d)')                     # [01] fansub style
 RE_EP_BARE       = re.compile(r'(?:^|[\s\-_])(\d{2,3})(?:[\s_]*[\[\(]|\s+-|\s*$|\s+(?=[A-Za-z])|\.\s)')
 RE_HALF_EP       = re.compile(r'(\d{1,3})\.5\b')                               # 7.5, 12.5 → treat floor as ep
 RE_EP_SEASONED3  = re.compile(r'(?:^|[\s\-_])([2-9])(\d{2})(?:[\s_]*[\[\(]|\s+-|\s*$|\s+(?=[A-Za-z])|\.\s)')  # 201→S2E01
@@ -197,6 +205,15 @@ def parse_episode(filename: str, season_hint: int = None):
         m = RE_EP_SEASONED3.search(stem)
         if m:
             return int(m.group(1)), int(m.group(2))
+
+        # [01] - the dominant anime fansub convention. Safe because quality
+        # and codec brackets always contain letters ([1080p], [x265_flac],
+        # [BD]), and capping at 3 digits keeps bare years like [1080] out.
+        m = RE_EP_BRACKET.search(stem)
+        if m:
+            ep = int(m.group(1))
+            if 0 <= ep <= 200:
+                return season_hint, ep
 
         # Bare episode number
         m = RE_EP_BARE.search(stem)
@@ -473,6 +490,29 @@ def _make_ep_filename(show_name: str, season: int, episode: int, title: str, ext
     return f"{prefix}{suffix}"
 
 
+def find_sidecars(video: Path) -> list[tuple[Path, str]]:
+    """Subtitle files belonging to one video: same stem, optional lang tag.
+
+    'Show [01][x265].mkv' owns 'Show [01][x265].sc.ass' and '.tc.ass'; the
+    part after the video stem ('.sc.ass') is carried across unchanged so the
+    language tag survives the rename.
+    """
+    out = []
+    stem = video.stem
+    try:
+        siblings = list(video.parent.iterdir())
+    except OSError:
+        return out
+    for p in siblings:
+        if p == video or not p.is_file():
+            continue
+        if p.suffix.lower() not in SUBTITLE_EXTS:
+            continue
+        if p.name.lower().startswith(stem.lower()):
+            out.append((p, p.name[len(stem):]))
+    return sorted(out)
+
+
 def build_plan(show_dir: Path, tmdb_result: dict, tmdb: TMDB, output_base: Path) -> list[tuple[Path, Path]]:
     show_name = tmdb_result['name']
     year = (tmdb_result.get('first_air_date') or '')[:4]
@@ -489,6 +529,13 @@ def build_plan(show_dir: Path, tmdb_result: dict, tmdb: TMDB, output_base: Path)
         ep_file = _make_ep_filename(show_name, season, episode, title, src.suffix)
         dst = output_base / folder_name / season_dir / ep_file
         ops.append((src, dst))
+
+        # Subtitles must keep the video's exact stem or players stop pairing
+        # them, so derive it from ep_file rather than rebuilding it - the
+        # title-truncation maths shifts when the extension length changes.
+        video_stem = ep_file[:-len(src.suffix)] if src.suffix else ep_file
+        for sub_src, tail in find_sidecars(src):
+            ops.append((sub_src, dst.parent / (video_stem + tail)))
 
     return ops
 
