@@ -135,9 +135,20 @@ def _prep_stem(filename: str) -> str:
     return stem
 
 
+RE_SEASON_WORD = re.compile(r'Season\s*(\d{1,2})', re.I)
+
+
 def parse_episode(filename: str, season_hint: int = None):
     """Return (season, episode) or None."""
     stem = _prep_stem(filename)
+
+    # "Show Season 02 - 05" must read as S02E05. Left in place, the bare
+    # matcher grabs the 02 from "Season 02" as the episode and returns E02,
+    # silently mislabelling every file in a multi-season batch.
+    msw = RE_SEASON_WORD.search(stem)
+    if msw:
+        season_hint = int(msw.group(1))
+        stem = RE_SEASON_WORD.sub(' ', stem)
 
     # Multi-episode range E01-E03 → first ep (check before SxxExx so we capture season too)
     mm = RE_EP_MULTI.search(stem)
@@ -377,8 +388,12 @@ def find_episodes(show_dir: Path) -> list[tuple[Path, int, int]]:
     """Return list of (path, season, episode)."""
     found = []
 
-    for root, dirs, files in os.walk(show_dir):
-        root_path = Path(root)
+    # Walk via the long-path form: these folders nest scene names inside
+    # scene names and blow past MAX_PATH easily (a 266-char subdirectory
+    # here reported isdir()==False), and os.walk then silently yields
+    # nothing at all. Strip the prefix again so the rest stays ordinary.
+    for root, dirs, files in os.walk(_long(show_dir)):
+        root_path = Path(_unlong(root))
         rel = root_path.relative_to(show_dir)
 
         # Skip junk dirs
@@ -519,6 +534,12 @@ def find_sidecars(video: Path) -> list[tuple[Path, str]]:
 _LONG_PREFIX = chr(92) * 2 + '?' + chr(92)
 
 
+def _unlong(p) -> str:
+    """Inverse of _long(), so downstream code sees ordinary paths."""
+    t = str(p)
+    return t[len(_LONG_PREFIX):] if t.startswith(_LONG_PREFIX) else t
+
+
 def _long(p) -> str:
     """Path Windows can actually open. No-op off Windows."""
     s = os.path.abspath(str(p))
@@ -641,6 +662,15 @@ def main():
             if len(ops) > 4:
                 print(f"    ... and {len(ops) - 4} more")
 
+            clashes = [d for _s, d in ops if os.path.exists(_long(d))]
+            if clashes:
+                print(f"    ! {len(clashes)} destination(s) already exist and "
+                      f"will be SKIPPED, not overwritten:")
+                for d in clashes[:3]:
+                    print(f"        {d.name[:66]}")
+                if len(clashes) > 3:
+                    print(f"        ... and {len(clashes) - 3} more")
+
             if dry:
                 total_ops.extend(ops)
                 continue
@@ -658,7 +688,17 @@ def main():
 
             moved = 0
             failed = 0
+            skipped = 0
             for src, dst in ops:
+                # Never overwrite. shutil.move clobbers silently, and a
+                # sequel released as "S01" of a differently-named show lands
+                # exactly on an existing season's filenames - six files onto
+                # six files, with no warning and no way back.
+                if os.path.exists(_long(dst)):
+                    logging.warning(f"EXISTS, skipped: {dst}")
+                    print(f"    ! exists, skipped: {dst.name[:60]}")
+                    skipped += 1
+                    continue
                 # One bad file must not abort the run half-moved.
                 try:
                     os.makedirs(_long(dst.parent), exist_ok=True)
@@ -671,16 +711,19 @@ def main():
                     failed += 1
 
             state[skey] = {
-                'status':    'done' if not failed else 'partial',
+                'status':    'done' if not (failed or skipped) else 'partial',
                 'folder':    folder,
                 'tmdb_id':   result['id'],
                 'name':      result['name'],
                 'year':      yr,
                 'moved':     moved,
                 'failed':    failed,
+                'skipped':   skipped,
             }
             save_state(state)
             removed = cleanup_empty_dirs(show_dir)
+            if skipped:
+                print(f"  ! {skipped} file(s) skipped - destination existed")
             print(f"  ✓ Moved {moved} files" + (f", removed {removed} empty dirs" if removed else ""))
 
     if dry and total_ops:
