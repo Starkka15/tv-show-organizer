@@ -513,6 +513,20 @@ def find_sidecars(video: Path) -> list[tuple[Path, str]]:
     return sorted(out)
 
 
+# Windows MAX_PATH is 260 chars and scene release names blow past it: a
+# 269-char source path failed with 'cannot find the path specified' while
+# the file existed fine. This prefix disables the limit.
+_LONG_PREFIX = chr(92) * 2 + '?' + chr(92)
+
+
+def _long(p) -> str:
+    """Path Windows can actually open. No-op off Windows."""
+    s = os.path.abspath(str(p))
+    if os.name == 'nt' and not s.startswith(_LONG_PREFIX):
+        s = _LONG_PREFIX + s
+    return s
+
+
 def build_plan(show_dir: Path, tmdb_result: dict, tmdb: TMDB, output_base: Path) -> list[tuple[Path, Path]]:
     show_name = tmdb_result['name']
     year = (tmdb_result.get('first_air_date') or '')[:4]
@@ -643,19 +657,27 @@ def main():
                 continue
 
             moved = 0
+            failed = 0
             for src, dst in ops:
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(src), str(dst))
-                logging.info(f"MOVE {src} → {dst}")
-                moved += 1
+                # One bad file must not abort the run half-moved.
+                try:
+                    os.makedirs(_long(dst.parent), exist_ok=True)
+                    shutil.move(_long(src), _long(dst))
+                    logging.info(f"MOVE {src} → {dst}")
+                    moved += 1
+                except OSError as e:
+                    logging.error(f"FAILED {src} -> {dst}: {e}")
+                    print(f"    ! failed: {src.name[:60]} ({e.__class__.__name__})")
+                    failed += 1
 
             state[skey] = {
-                'status':    'done',
+                'status':    'done' if not failed else 'partial',
                 'folder':    folder,
                 'tmdb_id':   result['id'],
                 'name':      result['name'],
                 'year':      yr,
                 'moved':     moved,
+                'failed':    failed,
             }
             save_state(state)
             removed = cleanup_empty_dirs(show_dir)
